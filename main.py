@@ -1,6 +1,6 @@
 """
-資金行為學 — FastAPI 後端 v1.3
-加入診斷端點，直接看 TWSE 回傳內容
+資金行為學 — FastAPI 後端 v1.4
+修正：加入 follow_redirects=True，解決 TWSE 307 轉址問題
 """
 
 from fastapi import FastAPI, HTTPException
@@ -10,7 +10,7 @@ import asyncio
 from datetime import datetime
 from statistics import mean
 
-app = FastAPI(title="資金行為學 API", version="1.3.0")
+app = FastAPI(title="資金行為學 API", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,11 +49,16 @@ def recent_months(n: int) -> list:
     return result
 
 async def safe_get(client, url: str, params: dict = None):
+    """跟隨轉址，最多重試 3 次"""
     for attempt in range(3):
         try:
-            await asyncio.sleep(0.5 * attempt)
+            await asyncio.sleep(0.3 * attempt)
             r = await client.get(
-                url, params=params or {}, headers=HEADERS, timeout=20
+                url,
+                params=params or {},
+                headers=HEADERS,
+                timeout=20,
+                follow_redirects=True,   # ← 關鍵修正
             )
             r.raise_for_status()
             return r.json()
@@ -63,71 +68,7 @@ async def safe_get(client, url: str, params: dict = None):
 
 
 # ════════════════════════════════════════════
-# 診斷端點 — 直接看 TWSE 各端點回傳什麼
-# ════════════════════════════════════════════
-@app.get("/debug/twse")
-async def debug_twse():
-    """
-    測試所有 TWSE 端點，回傳原始結果的前 300 字元
-    讓我們知道哪個端點有效、欄位格式是什麼
-    """
-    now = datetime.now()
-    ym  = now.strftime("%Y%m")
-    results = {}
-
-    async with httpx.AsyncClient() as client:
-
-        # 測試 1: openapi 今日大盤
-        d = await safe_get(client, "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX")
-        results["openapi_MI_INDEX"] = str(d)[:300]
-
-        await asyncio.sleep(1)
-
-        # 測試 2: openapi 每月指數
-        d = await safe_get(client, "https://openapi.twse.com.tw/v1/indices/MFI_INDEX")
-        results["openapi_MFI_INDEX"] = str(d)[:300]
-
-        await asyncio.sleep(1)
-
-        # 測試 3: rwd 大盤歷史（本月）
-        d = await safe_get(client,
-            "https://www.twse.com.tw/rwd/zh/indices/MI_5MINS_HIST",
-            {"date": ym + "01", "response": "json"}
-        )
-        results["rwd_MI_5MINS_HIST"] = str(d)[:300]
-
-        await asyncio.sleep(1)
-
-        # 測試 4: 舊版大盤歷史
-        d = await safe_get(client,
-            "https://www.twse.com.tw/exchangeReport/MI_INDEX",
-            {"response": "json", "date": ym + "01", "type": "IND"}
-        )
-        results["old_MI_INDEX"] = str(d)[:300]
-
-        await asyncio.sleep(1)
-
-        # 測試 5: 個股 0001（加權指數）當月日K
-        d = await safe_get(client,
-            "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY",
-            {"stockNo": "0001", "date": ym + "01", "response": "json"}
-        )
-        results["stock_0001"] = str(d)[:300]
-
-        await asyncio.sleep(1)
-
-        # 測試 6: 個股 2330 當月日K（驗證個股端點是否正常）
-        d = await safe_get(client,
-            "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY",
-            {"stockNo": "2330", "date": ym + "01", "response": "json"}
-        )
-        results["stock_2330"] = str(d)[:300]
-
-    return {"time": now.isoformat(), "ym": ym, "results": results}
-
-
-# ════════════════════════════════════════════
-# 個股日K + 均線
+# 端點 1：個股日K + 均線
 # ════════════════════════════════════════════
 @app.get("/stock/{stock_id}/price")
 async def get_price(stock_id: str):
@@ -151,6 +92,7 @@ async def get_price(stock_id: str):
                     rows.append({"close": close, "volume": volume, "date": row[0]})
                 except (ValueError, IndexError):
                     continue
+            await asyncio.sleep(0.5)
 
     if len(rows) < 5:
         raise HTTPException(status_code=404, detail=f"找不到 {stock_id} 的價格資料")
@@ -158,7 +100,8 @@ async def get_price(stock_id: str):
     rows    = sorted(rows, key=lambda x: x["date"])
     closes  = [r["close"]  for r in rows]
     volumes = [r["volume"] for r in rows]
-    latest, prev = rows[-1], rows[-2] if len(rows) >= 2 else rows[-1]
+    latest  = rows[-1]
+    prev    = rows[-2] if len(rows) >= 2 else rows[-1]
 
     chg   = round((latest["close"] - prev["close"]) / prev["close"] * 100, 2)
     ma20  = round(mean(closes[-20:]),  2) if len(closes)  >= 20 else None
@@ -167,13 +110,15 @@ async def get_price(stock_id: str):
     vol20 = round(mean(volumes[-20:]), 0) if len(volumes) >= 20 else None
 
     result = {
-        "stock_id": stock_id, "price": latest["close"],
-        "change_pct": chg,
-        "above_20ma": (latest["close"] > ma20) if ma20 else None,
-        "ma20": ma20, "ma60": ma60,
-        "vol5avg":  int(vol5)  if vol5  else None,
-        "vol20avg": int(vol20) if vol20 else None,
-        "data_date": latest["date"],
+        "stock_id":      stock_id,
+        "price":         latest["close"],
+        "change_pct":    chg,
+        "above_20ma":    (latest["close"] > ma20) if ma20 else None,
+        "ma20":          ma20,
+        "ma60":          ma60,
+        "vol5avg":       int(vol5)  if vol5  else None,
+        "vol20avg":      int(vol20) if vol20 else None,
+        "data_date":     latest["date"],
         "close_history": closes[-60:],
     }
     _cache[key] = result
@@ -181,7 +126,7 @@ async def get_price(stock_id: str):
 
 
 # ════════════════════════════════════════════
-# 三大法人
+# 端點 2：三大法人
 # ════════════════════════════════════════════
 @app.get("/stock/{stock_id}/institutional")
 async def get_institutional(stock_id: str):
@@ -208,6 +153,7 @@ async def get_institutional(stock_id: str):
                     sit_nets.append(sn)
                 except (ValueError, IndexError):
                     continue
+            await asyncio.sleep(0.5)
 
     def consec(lst):
         c = 0
@@ -217,10 +163,11 @@ async def get_institutional(stock_id: str):
         return c
 
     result = {
-        "stock_id": stock_id,
-        "sit_days": consec(sit_nets), "foreign_days": consec(foreign_nets),
-        "sit_buy":     (sit_nets[-1] > 0)     if sit_nets     else False,
-        "foreign_buy": (foreign_nets[-1] > 0) if foreign_nets else False,
+        "stock_id":        stock_id,
+        "sit_days":        consec(sit_nets),
+        "foreign_days":    consec(foreign_nets),
+        "sit_buy":         (sit_nets[-1] > 0)     if sit_nets     else False,
+        "foreign_buy":     (foreign_nets[-1] > 0) if foreign_nets else False,
         "recent5_sit":     sit_nets[-5:]     if len(sit_nets)     >= 5 else sit_nets,
         "recent5_foreign": foreign_nets[-5:] if len(foreign_nets) >= 5 else foreign_nets,
     }
@@ -229,7 +176,7 @@ async def get_institutional(stock_id: str):
 
 
 # ════════════════════════════════════════════
-# 大盤環境（暫時用備援邏輯，等診斷後修正）
+# 端點 3：大盤環境
 # ════════════════════════════════════════════
 @app.get("/market/regime")
 async def get_market_regime():
@@ -238,78 +185,50 @@ async def get_market_regime():
         return _cache[key]
 
     months = recent_months(4)
-    closes = []
+    rows = []
 
     async with httpx.AsyncClient() as client:
-        # 嘗試所有已知端點
         for ym in months:
-            for url, params in [
-                (
-                    "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY",
-                    {"stockNo": "0001", "date": ym + "01", "response": "json"},
-                ),
-                (
-                    "https://www.twse.com.tw/exchangeReport/MI_INDEX",
-                    {"response": "json", "date": ym + "01", "type": "IND"},
-                ),
-            ]:
-                data = await safe_get(client, url, params)
-                raw  = None
-                if isinstance(data, dict):
-                    raw = data.get("data") or data.get("data1") or data.get("data2")
-                if not raw:
+            data = await safe_get(client,
+                "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY",
+                {"stockNo": "0001", "date": ym + "01", "response": "json"},
+            )
+            for row in (data.get("data") if isinstance(data, dict) else []) or []:
+                try:
+                    close = float(row[6].replace(",", ""))
+                    rows.append({"date": row[0], "close": close})
+                except (ValueError, IndexError):
                     continue
-                for row in raw:
-                    try:
-                        # 嘗試第 6 欄（STOCK_DAY格式）
-                        val = str(row[6] if len(row) > 6 else row[1]).replace(",","")
-                        c   = float(val)
-                        if 1000 < c < 100000:   # 合理的大盤點位範圍
-                            closes.append({"date": str(row[0]), "close": c})
-                    except (ValueError, IndexError):
-                        continue
-                if closes:
-                    break
             await asyncio.sleep(0.5)
-            if len(closes) >= 20:
-                break
 
-        # 備援：openapi 今日
-        if len(closes) < 5:
-            d = await safe_get(client, "https://openapi.twse.com.tw/v1/exchangeReport/MI_INDEX")
-            if isinstance(d, list):
-                for item in d:
-                    if "發行量加權" in str(item.get("指數","")):
-                        try:
-                            c = float(str(item["收盤指數"]).replace(",",""))
-                            closes.append({"date": datetime.now().strftime("%Y/%m/%d"), "close": c})
-                        except Exception:
-                            pass
-
-    if not closes:
+    if len(rows) < 5:
         raise HTTPException(status_code=503, detail="無法取得大盤資料")
 
-    closes  = sorted(closes, key=lambda x: x["date"])
-    vals    = [r["close"] for r in closes]
-    latest  = vals[-1]
-    prev    = vals[-2] if len(vals) >= 2 else vals[-1]
-    chg     = round((latest - prev) / prev * 100, 2)
-    ma20    = round(mean(vals[-20:]), 2) if len(vals) >= 20 else None
-    ma60    = round(mean(vals[-60:]), 2) if len(vals) >= 60 else None
+    rows   = sorted(rows, key=lambda x: x["date"])
+    closes = [r["close"] for r in rows]
+    latest = rows[-1]
+    prev   = rows[-2] if len(rows) >= 2 else rows[-1]
 
-    if ma20 and ma60 and latest > ma20 > ma60:
+    chg  = round((latest["close"] - prev["close"]) / prev["close"] * 100, 2)
+    ma20 = round(mean(closes[-20:]), 2) if len(closes) >= 20 else None
+    ma60 = round(mean(closes[-60:]), 2) if len(closes) >= 60 else None
+
+    if ma20 and ma60 and latest["close"] > ma20 > ma60:
         regime, weight = "溫床市場", 1.0
-    elif ma20 and latest < ma20 and (not ma60 or ma20 < ma60):
+    elif ma20 and latest["close"] < ma20 and (not ma60 or ma20 < ma60):
         regime, weight = "墳場市場", 0.0
     else:
         regime, weight = "混沌輪動盤", 0.5
 
     result = {
-        "index": latest, "change_pct": chg,
-        "ma20": ma20, "ma60": ma60,
-        "above_20ma": (latest > ma20) if ma20 else None,
-        "regime": regime, "weight": weight,
-        "data_date": closes[-1]["date"],
+        "index":      latest["close"],
+        "change_pct": chg,
+        "ma20":       ma20,
+        "ma60":       ma60,
+        "above_20ma": (latest["close"] > ma20) if ma20 else None,
+        "regime":     regime,
+        "weight":     weight,
+        "data_date":  latest["date"],
     }
     _cache[key] = result
     return result
@@ -341,9 +260,12 @@ async def scan_stocks(body: dict):
     return {"results": results}
 
 
+# ════════════════════════════════════════════
+# 健康檢查
+# ════════════════════════════════════════════
 @app.get("/")
 def root():
-    return {"status": "ok", "version": "1.3.0"}
+    return {"status": "ok", "version": "1.4.0"}
 
 @app.get("/health")
 def health():
